@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git ls-tree:*)",
+      "Bash(cargo init:*)",
+      "Bash(source ~/.profile)",
+      "Bash(source ~/.bash_profile)",
+      "Bash(source ~/.bashrc)",
+      "Read(//usr/bin/**)",
+      "Bash(pacman -Q rustup rust 2>/dev/null || echo \"No rust packages found\")",
+      "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path 2>&1)",
+      "Bash(source ~/.cargo/env && cargo init --name podcast-tui /home/julian/DEV/Podcast-TUI 2>&1)",
+      "Bash(source ~/.cargo/env && cargo build 2>&1)"
+    ]
+  }
+}
