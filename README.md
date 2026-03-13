@@ -25,7 +25,7 @@ Ein TUI Podcast Player für das Terminal, gebaut mit Rust + Ratatui.
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/podcast-tui
+git clone https://github.com/heimer-dev/Podcast-TUI
 cd podcast-tui
 ./install.sh
 ```
