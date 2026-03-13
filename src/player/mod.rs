@@ -4,8 +4,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::events::Action;
@@ -48,13 +50,14 @@ pub enum SeekMode {
 }
 
 pub struct MpvController {
-    pub socket_path: std::path::PathBuf,
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     request_id: Arc<AtomicU64>,
 }
 
 impl MpvController {
-    pub async fn spawn(socket_path: &Path) -> Result<(Self, tokio::process::Child)> {
+    /// Spawns mpv and returns (controller, read_half_for_polling, child).
+    pub async fn spawn(socket_path: &Path) -> Result<(Self, OwnedReadHalf, tokio::process::Child)> {
+        info!("spawning mpv with socket {}", socket_path.display());
         let child = tokio::process::Command::new("mpv")
             .arg("--no-video")
             .arg("--idle=yes")
@@ -65,11 +68,13 @@ impl MpvController {
             .spawn()
             .context("Failed to spawn mpv — is it installed?")?;
 
-        // Wait for socket to appear
+        info!("mpv spawned (pid {:?}), waiting for socket", child.id());
+
         let mut attempts = 0u32;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
             if socket_path.exists() {
+                info!("socket appeared after {}ms", attempts * 150);
                 break;
             }
             attempts += 1;
@@ -81,31 +86,39 @@ impl MpvController {
         let stream = UnixStream::connect(socket_path)
             .await
             .context("Failed to connect to mpv IPC socket")?;
-        let (_, write_half) = stream.into_split();
+        info!("connected to mpv IPC socket");
+
+        // Keep BOTH halves of the same connection
+        let (read_half, write_half) = stream.into_split();
         let writer = Arc::new(Mutex::new(write_half));
         let request_id = Arc::new(AtomicU64::new(1));
 
-        let ctrl = Self {
-            socket_path: socket_path.to_path_buf(),
-            writer,
-            request_id,
-        };
+        let ctrl = Self { writer, request_id };
 
-        // Observe properties
-        ctrl.send_raw(&json!({"command": ["observe_property", 1, "time-pos"]})).await.ok();
-        ctrl.send_raw(&json!({"command": ["observe_property", 2, "duration"]})).await.ok();
-        ctrl.send_raw(&json!({"command": ["observe_property", 3, "pause"]})).await.ok();
-        ctrl.send_raw(&json!({"command": ["observe_property", 4, "chapter"]})).await.ok();
+        // observe_property on this connection → events arrive on read_half
+        for (id, prop) in [(1, "time-pos"), (2, "duration"), (3, "pause"), (4, "chapter")] {
+            if let Err(e) = ctrl.send_raw(&json!({"command": ["observe_property", id, prop]})).await {
+                warn!("observe_property {} failed: {}", prop, e);
+            } else {
+                debug!("observe_property {} ok", prop);
+            }
+        }
 
-        Ok((ctrl, child))
+        Ok((ctrl, read_half, child))
     }
 
     async fn send_raw(&self, cmd: &Value) -> Result<()> {
         let mut line = serde_json::to_string(cmd)?;
         line.push('\n');
+        debug!("mpv send: {}", line.trim());
         let mut w = self.writer.lock().await;
-        w.write_all(line.as_bytes()).await?;
-        Ok(())
+        match w.write_all(line.as_bytes()).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("mpv write failed: {}", e);
+                Err(e.into())
+            }
+        }
     }
 
     async fn send(&self, cmd: &Value) -> Result<()> {
@@ -116,15 +129,11 @@ impl MpvController {
     }
 
     pub async fn load_file(&self, path: &str) -> Result<()> {
-        self.send(&json!({"command": ["loadfile", path]})).await
+        self.send(&json!({"command": ["loadfile", path, "replace"]})).await
     }
 
     pub async fn toggle_pause(&self) -> Result<()> {
         self.send(&json!({"command": ["cycle", "pause"]})).await
-    }
-
-    pub async fn pause(&self) -> Result<()> {
-        self.send(&json!({"command": ["set_property", "pause", true]})).await
     }
 
     pub async fn seek(&self, seconds: f64, mode: SeekMode) -> Result<()> {
@@ -156,17 +165,9 @@ impl MpvController {
     }
 }
 
-/// Background task that polls mpv socket and sends PlaybackProgress actions.
-pub async fn poll_mpv(socket_path: std::path::PathBuf, tx: tokio::sync::mpsc::Sender<Action>) {
-    // Give the controller time to set up observers
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let stream = match UnixStream::connect(&socket_path).await {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let (read_half, _) = stream.into_split();
+/// Reads mpv events from the same connection read_half and sends PlaybackProgress.
+pub async fn poll_mpv(read_half: OwnedReadHalf, tx: tokio::sync::mpsc::Sender<Action>) {
+    info!("poll_mpv started");
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     let mut state = PlaybackState::new();
@@ -174,54 +175,71 @@ pub async fn poll_mpv(socket_path: std::path::PathBuf, tx: tokio::sync::mpsc::Se
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Err(_) => break,
+            Ok(0) => {
+                info!("poll_mpv: EOF");
+                break;
+            }
+            Err(e) => {
+                info!("poll_mpv read error: {}", e);
+                break;
+            }
             Ok(_) => {}
         }
 
-        if let Ok(val) = serde_json::from_str::<Value>(&line) {
-            let event = val.get("event").and_then(|e| e.as_str());
-            match event {
-                Some("property-change") => {
-                    let name = val.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let data = &val["data"];
-                    match name {
-                        "time-pos" => {
-                            if let Some(pos) = data.as_f64() {
-                                state.position_secs = pos;
-                            }
+        debug!("mpv recv: {}", line.trim());
+
+        let val = match serde_json::from_str::<Value>(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event = val.get("event").and_then(|e| e.as_str());
+        match event {
+            Some("property-change") => {
+                let name = val.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let data = &val["data"];
+                match name {
+                    "time-pos" => {
+                        if let Some(pos) = data.as_f64() {
+                            state.position_secs = pos;
                         }
-                        "duration" => {
-                            if let Some(dur) = data.as_f64() {
-                                state.duration_secs = dur;
-                            }
-                        }
-                        "pause" => {
-                            if let Some(paused) = data.as_bool() {
-                                state.status = if paused {
-                                    PlayStatus::Paused
-                                } else {
-                                    PlayStatus::Playing
-                                };
-                            }
-                        }
-                        "chapter" => {
-                            state.current_chapter_idx = data.as_u64().map(|c| c as usize);
-                        }
-                        _ => {}
                     }
-                    let _ = tx.try_send(Action::PlaybackProgress(state.clone()));
+                    "duration" => {
+                        if let Some(dur) = data.as_f64() {
+                            state.duration_secs = dur;
+                        }
+                    }
+                    "pause" => {
+                        if let Some(paused) = data.as_bool() {
+                            state.status = if paused {
+                                PlayStatus::Paused
+                            } else {
+                                PlayStatus::Playing
+                            };
+                            info!("mpv pause={}", paused);
+                        }
+                    }
+                    "chapter" => {
+                        state.current_chapter_idx = data.as_u64().map(|c| c as usize);
+                    }
+                    _ => {}
                 }
-                Some("end-file") => {
-                    state.status = PlayStatus::Stopped;
-                    state.position_secs = 0.0;
-                    let _ = tx.try_send(Action::PlaybackProgress(state.clone()));
-                }
-                Some("start-file") => {
-                    state.status = PlayStatus::Playing;
-                }
-                _ => {}
+                let _ = tx.try_send(Action::PlaybackProgress(state.clone()));
             }
+            Some("end-file") => {
+                info!("mpv end-file: {:?}", val.get("reason"));
+                state.status = PlayStatus::Stopped;
+                state.position_secs = 0.0;
+                let _ = tx.try_send(Action::PlaybackProgress(state.clone()));
+            }
+            Some("start-file") => {
+                info!("mpv start-file");
+                state.status = PlayStatus::Playing;
+            }
+            Some(other) => {
+                debug!("mpv event: {}", other);
+            }
+            None => {}
         }
     }
 }

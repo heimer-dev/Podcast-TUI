@@ -113,7 +113,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // --- Row 3: Key hints ---
     if chunks[2].height > 0 {
-        let hints = "[Space] ▶/⏸  [h/l] seek  [H/L] +1min  [+/-] vol  [</>] speed  [[]]] chapter  [r] refresh  [q] quit";
+        let hints = "[Space] ▶/⏸  [h/l] seek  [+/-] vol  [</>] speed  [[]]] chapter  [a] add feed  [r] refresh  [?] help  [q] quit";
         let hints_p = Paragraph::new(hints)
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);

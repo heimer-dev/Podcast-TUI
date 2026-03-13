@@ -85,6 +85,8 @@ pub fn render(frame: &mut Frame, state: &AppState, ui_state: &mut UiState) {
     // --- Overlays ---
     if state.input_mode == InputMode::AddFeedUrl {
         render_input_modal(frame, size, state);
+    } else if state.show_help {
+        render_help_modal(frame, size);
     }
 
     if let Some(msg) = &state.status_message {
@@ -94,9 +96,71 @@ pub fn render(frame: &mut Frame, state: &AppState, ui_state: &mut UiState) {
     }
 }
 
+fn render_help_modal(frame: &mut Frame, area: Rect) {
+    const W: u16 = 52;
+    const H: u16 = 26;
+    let x = area.width.saturating_sub(W) / 2;
+    let y = area.height.saturating_sub(H) / 2;
+    let modal = Rect::new(x, y, W.min(area.width), H.min(area.height));
+
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Tastenkürzel — [?] oder [Esc] schließen ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let key = |k: &str| Span::styled(format!("{:>10}", k), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let sep = || Span::raw("  ");
+    let desc = |d: &str| Span::styled(d.to_string(), Style::default().fg(Color::White));
+    let header = |t: &str| Line::from(Span::styled(
+        format!("  {}", t),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    ));
+    let blank = || Line::from("");
+
+    let lines = vec![
+        blank(),
+        header("Navigation"),
+        Line::from(vec![key("Tab"),       sep(), desc("Fokus: Feeds ↔ Episoden")]),
+        Line::from(vec![key("j / k"),     sep(), desc("Liste hoch / runter")]),
+        Line::from(vec![key("↑ / ↓"),     sep(), desc("Liste hoch / runter")]),
+        Line::from(vec![key("Enter"),     sep(), desc("Episode abspielen")]),
+        blank(),
+        header("Feed-Verwaltung"),
+        Line::from(vec![key("a"),         sep(), desc("Feed hinzufügen (URL)")]),
+        Line::from(vec![key("d"),         sep(), desc("Feed löschen")]),
+        Line::from(vec![key("r"),         sep(), desc("Feed aktualisieren")]),
+        Line::from(vec![key("R"),         sep(), desc("Alle Feeds aktualisieren")]),
+        blank(),
+        header("Wiedergabe"),
+        Line::from(vec![key("Space"),     sep(), desc("Play / Pause")]),
+        Line::from(vec![key("l / →"),     sep(), desc("10 Sek. vor")]),
+        Line::from(vec![key("h / ←"),     sep(), desc("10 Sek. zurück")]),
+        Line::from(vec![key("L / H"),     sep(), desc("1 Min. vor / zurück")]),
+        Line::from(vec![key("+ / -"),     sep(), desc("Lautstärke ±5%")]),
+        Line::from(vec![key("> / <"),     sep(), desc("Geschwindigkeit ±0.25x")]),
+        Line::from(vec![key("] / ["),     sep(), desc("Nächstes / Voriges Kapitel")]),
+        blank(),
+        header("Download & App"),
+        Line::from(vec![key("D"),         sep(), desc("Episode herunterladen")]),
+        Line::from(vec![key("?"),         sep(), desc("Diese Hilfe öffnen/schließen")]),
+        Line::from(vec![key("q"),         sep(), desc("Beenden")]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_title_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let feed_count = state.feeds.len();
-    let right = format!("{} feed(s) | [Tab] focus [q] quit", feed_count);
+    let right = format!("{} feed(s) | [?] hilfe [q] quit", feed_count);
     let left = " ♪  PodcastTUI";
 
     let bar = Layout::default()

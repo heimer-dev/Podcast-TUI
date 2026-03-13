@@ -37,7 +37,9 @@ pub enum Action {
 
     // App
     Quit,
+    ToggleHelp,
     Resize(u16, u16),
+    CrosstermKey(crossterm::event::KeyEvent),
 
     // Internal (background tasks → main loop)
     FeedRefreshed(Uuid, String, Vec<crate::rss::types::Episode>),

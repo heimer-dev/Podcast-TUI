@@ -10,7 +10,9 @@
       "Bash(pacman -Q rustup rust 2>/dev/null || echo \"No rust packages found\")",
       "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path 2>&1)",
       "Bash(source ~/.cargo/env && cargo init --name podcast-tui /home/julian/DEV/Podcast-TUI 2>&1)",
-      "Bash(source ~/.cargo/env && cargo build 2>&1)"
+      "Bash(source ~/.cargo/env && cargo build 2>&1)",
+      "Bash(source ~/.cargo/env.fish 2>/dev/null; ~/.cargo/bin/cargo build 2>&1 | grep -E \"^error|^warning.*unused|Finished|Compiling podcast\")",
+      "Bash(~/.cargo/bin/cargo build:*)"
     ]
   }
 }

@@ -39,6 +39,7 @@ pub struct AppState {
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub downloading: HashSet<Uuid>,
+    pub show_help: bool,
     pub should_quit: bool,
 }
 
@@ -54,6 +55,7 @@ impl AppState {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             downloading: HashSet::new(),
+            show_help: false,
             should_quit: false,
         }
     }

@@ -17,6 +17,8 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
+use tracing::{debug, info};
+use tracing_subscriber;
 
 use app::{AppState, Focus, InputMode, StatusLevel};
 use config::Config;
@@ -39,6 +41,20 @@ async fn main() -> Result<()> {
         original_hook(info);
     }));
 
+    // File logging (never to stdout — ratatui owns the terminal)
+    let log_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("podcast-tui");
+    std::fs::create_dir_all(&log_dir).ok();
+    let file_appender = tracing_appender::rolling::never(&log_dir, "debug.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+    info!("podcast-tui starting, log: {}/debug.log", log_dir.display());
+
     // Load config
     let cfg = config::load().unwrap_or_default();
     let mut state = AppState::new(cfg.feeds.clone());
@@ -55,9 +71,36 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Channels: background tasks → main loop
+    // Channels: background tasks + keyboard → main loop
     let (tx, mut rx) = mpsc::channel::<Action>(256);
     let download_manager = DownloadManager::new(tx.clone());
+
+    // Dedicated blocking thread for crossterm keyboard input
+    let input_tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        info!("input thread started");
+        loop {
+            match event::read() {
+                Ok(Event::Key(k)) => {
+                    debug!("raw key: code={:?} kind={:?} modifiers={:?}", k.code, k.kind, k.modifiers);
+                    if input_tx.blocking_send(Action::CrosstermKey(k)).is_err() {
+                        info!("input channel closed, exiting thread");
+                        break;
+                    }
+                }
+                Ok(Event::Resize(w, h)) => {
+                    let _ = input_tx.blocking_send(Action::Resize(w, h));
+                }
+                Ok(other) => {
+                    debug!("other event: {:?}", other);
+                }
+                Err(e) => {
+                    info!("event::read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
     // Spawn mpv
     let mpv_socket = PathBuf::from(MPV_SOCKET);
@@ -66,12 +109,10 @@ async fn main() -> Result<()> {
 
     let mpv_result = MpvController::spawn(&mpv_socket).await;
     let (mpv, _mpv_child) = match mpv_result {
-        Ok(pair) => {
-            // Start mpv polling task
+        Ok((ctrl, read_half, child)) => {
+            // Poll events from the SAME connection read_half (observe_property works)
             let poll_tx = tx.clone();
-            let poll_socket = mpv_socket.clone();
-            tokio::spawn(player::poll_mpv(poll_socket, poll_tx));
-            let (ctrl, child) = pair;
+            tokio::spawn(player::poll_mpv(read_half, poll_tx));
             ctrl.set_volume(current_cfg.settings.default_volume).await.ok();
             ctrl.set_speed(current_cfg.settings.default_speed).await.ok();
             (Some(ctrl), Some(child))
@@ -87,12 +128,9 @@ async fn main() -> Result<()> {
 
     let mut ui_state = UiState::new();
     let mut last_save = std::time::Instant::now();
-    let tick = Duration::from_millis(TICK_MS);
+    let mut render_interval = tokio::time::interval(Duration::from_millis(TICK_MS));
 
     loop {
-        // Render
-        terminal.draw(|frame| ui::render(frame, &state, &mut ui_state))?;
-
         // Expire status messages
         if let Some(msg) = &state.status_message {
             if msg.expires_at <= std::time::Instant::now() {
@@ -100,36 +138,33 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Poll crossterm events (non-blocking) OR background actions
-        let action = tokio::select! {
-            _ = tokio::time::sleep(tick) => {
-                if event::poll(Duration::from_millis(0))? {
-                    match event::read()? {
-                        Event::Key(k) => map_key(k, &state),
-                        Event::Resize(w, h) => Some(Action::Resize(w, h)),
-                        _ => None,
-                    }
-                } else {
-                    None
+        // Either a tick (for re-render) or an action from keyboard/background
+        tokio::select! {
+            _ = render_interval.tick() => {
+                terminal.draw(|frame| ui::render(frame, &state, &mut ui_state))?;
+            }
+            Some(action) = rx.recv() => {
+                // Map raw key events using current state
+                let action = match action {
+                    Action::CrosstermKey(k) => map_key(k, &state),
+                    other => Some(other),
+                };
+                if let Some(action) = action {
+                    process_action(
+                        action,
+                        &mut state,
+                        &mut current_cfg,
+                        &mpv,
+                        &download_manager,
+                        &download_dir,
+                        tx.clone(),
+                    )
+                    .await;
                 }
             }
-            Some(bg) = rx.recv() => Some(bg),
-        };
-
-        if let Some(action) = action {
-            process_action(
-                action,
-                &mut state,
-                &mut current_cfg,
-                &mpv,
-                &download_manager,
-                &download_dir,
-                tx.clone(),
-            )
-            .await;
         }
 
-        // Auto-save playback position every 30s
+        // Auto-save every 30s
         if last_save.elapsed() > Duration::from_secs(30) {
             save_state(&state, &mut current_cfg);
             last_save = std::time::Instant::now();
@@ -153,12 +188,27 @@ async fn main() -> Result<()> {
 }
 
 fn map_key(key: crossterm::event::KeyEvent, state: &AppState) -> Option<Action> {
+    use crossterm::event::KeyEventKind;
+    if key.kind != KeyEventKind::Press {
+        debug!("map_key: skipping non-press event kind={:?}", key.kind);
+        return None;
+    }
+    debug!("map_key: processing code={:?}", key.code);
+
     if state.input_mode == InputMode::AddFeedUrl {
         return match key.code {
             KeyCode::Enter => Some(Action::ConfirmAddFeed),
             KeyCode::Esc => Some(Action::CancelInput),
             KeyCode::Char(c) => Some(Action::InputChar(c)),
             KeyCode::Backspace => Some(Action::InputBackspace),
+            _ => None,
+        };
+    }
+
+    // Help overlay eats all keys except close keys
+    if state.show_help {
+        return match key.code {
+            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => Some(Action::ToggleHelp),
             _ => None,
         };
     }
@@ -185,6 +235,7 @@ fn map_key(key: crossterm::event::KeyEvent, state: &AppState) -> Option<Action> 
         KeyCode::Char(']') => Some(Action::NextChapter),
         KeyCode::Char('[') => Some(Action::PrevChapter),
         KeyCode::Char('D') => Some(Action::DownloadEpisode),
+        KeyCode::Char('?') => Some(Action::ToggleHelp),
         _ => None,
     }
 }
@@ -198,8 +249,11 @@ async fn process_action(
     download_dir: &PathBuf,
     tx: mpsc::Sender<Action>,
 ) {
+    debug!("process_action: {:?}", action);
     match action {
         Action::Quit => state.should_quit = true,
+
+        Action::ToggleHelp => state.show_help = !state.show_help,
 
         Action::Resize(_, _) => {}
 
@@ -254,7 +308,10 @@ async fn process_action(
                         _ => ep.audio_url.clone(),
                     };
                     if let Some(mpv) = mpv {
-                        mpv.load_file(&audio_url).await.ok();
+                        info!("loading: {}", audio_url);
+                        if let Err(e) = mpv.load_file(&audio_url).await {
+                            info!("load_file error: {}", e);
+                        }
                         mpv.set_speed(state.playback.speed).await.ok();
                         mpv.set_volume(state.playback.volume).await.ok();
                         state.playback.episode_id = Some(ep.id);
@@ -390,7 +447,12 @@ async fn process_action(
 
         Action::PlayPause => {
             if let Some(mpv) = mpv {
-                mpv.toggle_pause().await.ok();
+                info!("toggle_pause called");
+                if let Err(e) = mpv.toggle_pause().await {
+                    info!("toggle_pause error: {}", e);
+                }
+            } else {
+                info!("PlayPause: mpv is None");
             }
         }
 
@@ -525,6 +587,9 @@ async fn process_action(
         Action::StatusMessage(text, level) => {
             state.set_status(text, level);
         }
+
+        // Already mapped before reaching process_action
+        Action::CrosstermKey(_) => {}
     }
 }
 
