@@ -12,7 +12,8 @@
       "Bash(source ~/.cargo/env && cargo init --name podcast-tui /home/julian/DEV/Podcast-TUI 2>&1)",
       "Bash(source ~/.cargo/env && cargo build 2>&1)",
       "Bash(source ~/.cargo/env.fish 2>/dev/null; ~/.cargo/bin/cargo build 2>&1 | grep -E \"^error|^warning.*unused|Finished|Compiling podcast\")",
-      "Bash(~/.cargo/bin/cargo build:*)"
+      "Bash(~/.cargo/bin/cargo build:*)",
+      "Bash(chmod +x /home/julian/DEV/Podcast-TUI/install.sh)"
     ]
   }
 }
